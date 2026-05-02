@@ -14,7 +14,7 @@ once_cell = "*"
 ndn-lib = { path = "../ndn-lib" }
 async-trait = {workspace = true}
 buckyos-kit = {workspace = true}
-cyfs-gateway-lib = { workspace = true }
+buckyos-http-server = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body = "1"

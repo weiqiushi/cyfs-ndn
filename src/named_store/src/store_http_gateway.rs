@@ -6,8 +6,8 @@
 //! 资源类型由 `obj_id.is_chunk()` 自动判定，不需要额外 header。
 
 use async_trait::async_trait;
+use buckyos_http_server::{HttpServer, ServerError, ServerResult, StreamInfo};
 use bytes::Bytes;
-use cyfs_gateway_lib::{HttpServer, ServerError, ServerResult, StreamInfo};
 use http::{Method, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};

@@ -10,8 +10,8 @@
 //! CYFS get/download 支持在下个迭代导入旧实现，当前仅做占位。
 
 use async_trait::async_trait;
+use buckyos_http_server::{HttpServer, ServerError, ServerResult, StreamInfo};
 use bytes::Bytes;
-use cyfs_gateway_lib::{HttpServer, ServerError, ServerResult, StreamInfo};
 use http::{Method, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};

@@ -2,7 +2,7 @@ use crate::{NdnError, NdnResult, ObjId};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::str::FromStr;
-use url::Url;
+use url::{form_urlencoded, Url};
 
 // =============================================================
 // URL helpers
@@ -106,6 +106,188 @@ pub fn cyfs_parse_url(cyfs_url: &str) -> NdnResult<CyfsParsedUrl> {
         query,
         resp_raw,
     })
+}
+
+// =============================================================
+// Dispatch and semantic-list helpers
+// =============================================================
+
+pub const CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON: &str = "application/cyfs-named-object+json";
+
+pub const CYFS_HEADER_DISPATCH_ERROR: &str = "cyfs-dispatch-error";
+pub const CYFS_DISPATCH_ERROR_NO_HANDLER: &str = "no-handler";
+
+pub const CYFS_HEADER_LIST_MODE: &str = "cyfs-list-mode";
+pub const CYFS_HEADER_LIST_TRUNCATED: &str = "cyfs-list-truncated";
+
+/// Maximum child ObjectIds in one loose semantic-list response.
+pub const CYFS_SEMANTIC_LIST_MAX_CHILDREN: usize = 4096;
+
+/// Validate the URL shape for protocol-level `dispatch`.
+///
+/// Dispatch writes to a semantic path only; it MUST NOT target an inner_path
+/// because NamedObjects are immutable.
+pub fn validate_cyfs_dispatch_url(parsed: &CyfsParsedUrl) -> NdnResult<()> {
+    if !parsed.inner_path_steps.is_empty() {
+        return Err(NdnError::InvalidParam(
+            "dispatch URL MUST NOT contain inner_path segments".to_string(),
+        ));
+    }
+    if parsed.root_locator.is_empty() || parsed.root_locator == "/" {
+        return Err(NdnError::InvalidParam(
+            "dispatch URL MUST contain a semantic path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Check `Content-Type` for a dispatch body. Parameters such as `charset=utf-8`
+/// are accepted.
+pub fn is_cyfs_named_object_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(|v| {
+            v.trim()
+                .eq_ignore_ascii_case(CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON)
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CyfsSemanticListMode {
+    Strict,
+    Loose,
+}
+
+impl CyfsSemanticListMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Loose => "loose",
+        }
+    }
+
+    pub fn parse(raw: &str) -> NdnResult<Self> {
+        match raw {
+            "strict" => Ok(Self::Strict),
+            "loose" => Ok(Self::Loose),
+            _ => Err(NdnError::InvalidParam(format!(
+                "unsupported semantic list mode: {}",
+                raw
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CyfsSemanticListQuery {
+    /// `list=loose|strict`; absent means the host may use its default shape.
+    pub mode: Option<CyfsSemanticListMode>,
+    /// Opaque cursor accepted by the host: ObjectId, timestamp, or app-defined token.
+    pub before: Option<String>,
+    /// Opaque cursor accepted by the host: ObjectId, timestamp, or app-defined token.
+    pub after: Option<String>,
+    /// Requested page size. Values above the protocol maximum are rejected.
+    pub limit: Option<usize>,
+}
+
+pub fn parse_cyfs_semantic_list_query(parsed: &CyfsParsedUrl) -> NdnResult<CyfsSemanticListQuery> {
+    let Some(query) = &parsed.query else {
+        return Ok(CyfsSemanticListQuery::default());
+    };
+
+    let mut out = CyfsSemanticListQuery::default();
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "list" => {
+                out.mode = Some(CyfsSemanticListMode::parse(value.as_ref())?);
+            }
+            "before" => {
+                out.before = Some(value.into_owned());
+            }
+            "after" => {
+                out.after = Some(value.into_owned());
+            }
+            "limit" => {
+                let limit = value.parse::<usize>().map_err(|e| {
+                    NdnError::InvalidParam(format!("invalid semantic list limit: {}", e))
+                })?;
+                if limit > CYFS_SEMANTIC_LIST_MAX_CHILDREN {
+                    return Err(NdnError::InvalidParam(format!(
+                        "semantic list limit {} exceeds max {}",
+                        limit, CYFS_SEMANTIC_LIST_MAX_CHILDREN
+                    )));
+                }
+                out.limit = Some(limit);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CyfsSemanticListRespHeaders {
+    /// Actual list shape used by the host for this response.
+    pub mode: Option<CyfsSemanticListMode>,
+    /// Whether the host truncated the child list and the client should page.
+    pub truncated: Option<bool>,
+}
+
+pub fn get_cyfs_semantic_list_resp_headers(
+    headers: &HeaderMap,
+) -> NdnResult<CyfsSemanticListRespHeaders> {
+    let mode = header_get_str(headers, CYFS_HEADER_LIST_MODE)?
+        .map(|raw| CyfsSemanticListMode::parse(raw.as_str()))
+        .transpose()?;
+    let truncated = header_get_str(headers, CYFS_HEADER_LIST_TRUNCATED)?
+        .map(|raw| parse_header_bool(CYFS_HEADER_LIST_TRUNCATED, raw.as_str()))
+        .transpose()?;
+
+    Ok(CyfsSemanticListRespHeaders { mode, truncated })
+}
+
+pub fn apply_cyfs_semantic_list_resp_headers(
+    resp: &CyfsSemanticListRespHeaders,
+    headers: &mut HeaderMap,
+) -> NdnResult<()> {
+    if let Some(mode) = resp.mode {
+        insert_header(headers, CYFS_HEADER_LIST_MODE, mode.as_str())?;
+    }
+    if let Some(truncated) = resp.truncated {
+        insert_header(
+            headers,
+            CYFS_HEADER_LIST_TRUNCATED,
+            if truncated { "true" } else { "false" },
+        )?;
+    }
+    Ok(())
+}
+
+/// Parse a loose semantic-list body. The protocol shape is only `ObjectId[]`;
+/// full object inlining is intentionally left out of this helper.
+pub fn parse_cyfs_loose_list_body(body: &str) -> NdnResult<Vec<ObjId>> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        NdnError::InvalidData(format!("parse loose semantic list body failed: {}", e))
+    })?;
+    let arr = value.as_array().ok_or_else(|| {
+        NdnError::InvalidData("loose semantic list body MUST be an ObjectId array".to_string())
+    })?;
+    if arr.len() > CYFS_SEMANTIC_LIST_MAX_CHILDREN {
+        return Err(NdnError::InvalidData(format!(
+            "loose semantic list child count {} exceeds max {}",
+            arr.len(),
+            CYFS_SEMANTIC_LIST_MAX_CHILDREN
+        )));
+    }
+
+    let mut result = Vec::with_capacity(arr.len());
+    for item in arr {
+        result.push(ObjId::from_value(item)?);
+    }
+    Ok(result)
 }
 
 // =============================================================
@@ -443,6 +625,17 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> NdnResult<
     Ok(())
 }
 
+fn parse_header_bool(name: &str, raw: &str) -> NdnResult<bool> {
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(NdnError::DecodeError(format!(
+            "parse {} bool failed: {}",
+            name, raw
+        ))),
+    }
+}
+
 // =============================================================
 // Tests
 // =============================================================
@@ -458,6 +651,73 @@ mod tests {
         assert_eq!(parsed.root_locator, "/all_images");
         assert_eq!(parsed.inner_path_steps, vec!["readme", "content"]);
         assert!(parsed.resp_raw);
+    }
+
+    #[test]
+    fn test_dispatch_url_validation() {
+        let parsed = cyfs_parse_url("http://zone.example/did:bns:alice/inbox").unwrap();
+        validate_cyfs_dispatch_url(&parsed).unwrap();
+
+        let with_inner =
+            cyfs_parse_url("http://zone.example/did:bns:alice/inbox/@/content").unwrap();
+        assert!(validate_cyfs_dispatch_url(&with_inner).is_err());
+
+        let root_only = cyfs_parse_url("http://zone.example/").unwrap();
+        assert!(validate_cyfs_dispatch_url(&root_only).is_err());
+    }
+
+    #[test]
+    fn test_named_object_content_type() {
+        assert!(is_cyfs_named_object_content_type(
+            "application/cyfs-named-object+json"
+        ));
+        assert!(is_cyfs_named_object_content_type(
+            "Application/CYFS-Named-Object+JSON; charset=utf-8"
+        ));
+        assert!(!is_cyfs_named_object_content_type("application/json"));
+    }
+
+    #[test]
+    fn test_semantic_list_query_parse() {
+        let parsed =
+            cyfs_parse_url("http://zone.example/did:bns:group/inbox?list=loose&after=123&limit=10")
+                .unwrap();
+        let query = parse_cyfs_semantic_list_query(&parsed).unwrap();
+        assert_eq!(query.mode, Some(CyfsSemanticListMode::Loose));
+        assert_eq!(query.after.as_deref(), Some("123"));
+        assert_eq!(query.limit, Some(10));
+
+        let too_large = cyfs_parse_url(&format!(
+            "http://zone.example/inbox?list=loose&limit={}",
+            CYFS_SEMANTIC_LIST_MAX_CHILDREN + 1
+        ))
+        .unwrap();
+        assert!(parse_cyfs_semantic_list_query(&too_large).is_err());
+    }
+
+    #[test]
+    fn test_semantic_list_resp_headers_roundtrip() {
+        let src = CyfsSemanticListRespHeaders {
+            mode: Some(CyfsSemanticListMode::Loose),
+            truncated: Some(true),
+        };
+        let mut headers = HeaderMap::new();
+        apply_cyfs_semantic_list_resp_headers(&src, &mut headers).unwrap();
+        let back = get_cyfs_semantic_list_resp_headers(&headers).unwrap();
+        assert_eq!(back.mode, Some(CyfsSemanticListMode::Loose));
+        assert_eq!(back.truncated, Some(true));
+    }
+
+    #[test]
+    fn test_loose_list_body_parse() {
+        let body = r#"["sha256:0203040506","cyobj:01020304"]"#;
+        let ids = parse_cyfs_loose_list_body(body).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].to_string(), "sha256:0203040506");
+        assert_eq!(ids[1].to_string(), "cyobj:01020304");
+
+        assert!(parse_cyfs_loose_list_body(r#"{"id":"sha256:0203040506"}"#).is_err());
+        assert!(parse_cyfs_loose_list_body(r#"[{"id":"sha256:0203040506"}]"#).is_err());
     }
 
     #[test]

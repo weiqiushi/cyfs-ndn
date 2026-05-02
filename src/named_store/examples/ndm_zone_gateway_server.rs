@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
+use buckyos_http_server::{HttpServer, ServerError, ServerErrorCode, StreamInfo};
 use bytes::Bytes;
-use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode, StreamInfo};
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;

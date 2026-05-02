@@ -14,7 +14,7 @@
 //!   upload (`InStore` mode, original file deleted after success).
 //!
 //! This module is deliberately self-contained: it does not pull in
-//! `cyfs_gateway_lib` or any zone-gateway plumbing, so the HTTP body type is
+//! `buckyos_http_server` or any zone-gateway plumbing, so the HTTP body type is
 //! the plain `BoxBody<Bytes, std::io::Error>`. Embedders are expected to adapt
 //! their outer body error to `std::io::Error` at the boundary.
 

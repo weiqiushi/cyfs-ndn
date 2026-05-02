@@ -10,8 +10,10 @@
 //! - `/ndm/proxy/v1/write/*` —— 原子一次写入
 
 use async_trait::async_trait;
+use buckyos_http_server::{
+    server_err, HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo,
+};
 use bytes::Bytes;
-use cyfs_gateway_lib::{server_err, HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo};
 use futures_util::StreamExt;
 use http::{Method, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;

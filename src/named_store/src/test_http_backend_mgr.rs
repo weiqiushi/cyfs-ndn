@@ -15,8 +15,8 @@ mod tests {
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
     use crate::{NamedDataMgr, NamedLocalConfig, NamedStore, StoreLayout, StoreTarget};
 
+    use buckyos_http_server::{HttpServer, ServerError, ServerErrorCode};
     use bytes::Bytes;
-    use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode};
     use http_body_util::combinators::BoxBody;
     use http_body_util::{BodyExt, Full};
     use hyper::server::conn::http1;
@@ -71,9 +71,12 @@ mod tests {
                             });
 
                             let resp: http::Response<
-                                BoxBody<Bytes, cyfs_gateway_lib::ServerError>,
+                                BoxBody<Bytes, buckyos_http_server::ServerError>,
                             > = gw
-                                .serve_request(gateway_req, cyfs_gateway_lib::StreamInfo::default())
+                                .serve_request(
+                                    gateway_req,
+                                    buckyos_http_server::StreamInfo::default(),
+                                )
                                 .await
                                 .unwrap_or_else(|e| {
                                     http::Response::builder()

@@ -5,8 +5,8 @@
 //! 通过真实 HTTP/1.1 loopback 连接串联起来，
 //! 覆盖 `doc/ndm_proxy_testcases.md` 中的首批回归子集与端到端闭环。
 
+use buckyos_http_server::{HttpServer, ServerError, ServerErrorCode, StreamInfo};
 use bytes::Bytes;
-use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode, StreamInfo};
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
