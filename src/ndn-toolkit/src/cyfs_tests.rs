@@ -11,8 +11,10 @@
 //! collects the resulting body, and returns it to the client — this avoids
 //! binding to a real network socket in tests.
 
+use buckyos_http_server::{HttpServer, ServerError, StreamInfo};
 use bytes::Bytes;
 use http::{HeaderName as HttpHeaderName, HeaderValue as HttpHeaderValue, Request as HttpRequest};
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::path::Path;
@@ -152,11 +154,16 @@ impl CyfsHttpTransport for InProcServerTransport {
                     hdrs.insert(name, value);
                 }
             }
+            let body: BoxBody<Bytes, ServerError> =
+                Empty::<Bytes>::new().map_err(|never| match never {}).boxed();
             let req_http = builder
-                .body(Empty::<Bytes>::new())
+                .body(body)
                 .map_err(|e| NdnError::Internal(format!("build http request: {}", e)))?;
 
-            let response = server.serve_request(req_http).await;
+            let response = server
+                .serve_request(req_http, StreamInfo::default())
+                .await
+                .map_err(|e| NdnError::Internal(format!("serve_request failed: {}", e)))?;
             let (parts, body) = response.into_parts();
 
             let status = reqwest::StatusCode::from_u16(parts.status.as_u16())
@@ -730,13 +737,18 @@ async fn server_get(
     server: &Arc<NdnDirServer>,
     path_and_query: &str,
 ) -> (http::StatusCode, http::HeaderMap<HttpHeaderValue>, Vec<u8>) {
+    let body: BoxBody<Bytes, ServerError> =
+        Empty::<Bytes>::new().map_err(|never| match never {}).boxed();
     let req = HttpRequest::builder()
         .method("GET")
         .uri(path_and_query)
         .header(http::header::HOST, "local.test")
-        .body(Empty::<Bytes>::new())
+        .body(body)
         .unwrap();
-    let resp = server.serve_request(req).await;
+    let resp = server
+        .serve_request(req, StreamInfo::default())
+        .await
+        .expect("serve_request must not surface a transport-level error");
     let (parts, body) = resp.into_parts();
     let collected = body.collect().await.unwrap();
     (parts.status, parts.headers, collected.to_bytes().to_vec())

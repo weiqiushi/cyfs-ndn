@@ -44,10 +44,10 @@ named_store = { path = "../named_store" }
 name-lib = { workspace = true }
 name-client = { workspace = true }
 buckyos-kit = { workspace = true }
+buckyos-http-server = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 url = { workspace = true }
 base64 = "0.22"
-buckyos-http-server = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

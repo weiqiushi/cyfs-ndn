@@ -13,13 +13,17 @@
 //!   `NamedStoreMgr` either by local link (`LocalLink` mode) or by stream
 //!   upload (`InStore` mode, original file deleted after success).
 //!
-//! This module is deliberately self-contained: it does not pull in
-//! `buckyos_http_server` or any zone-gateway plumbing, so the HTTP body type is
-//! the plain `BoxBody<Bytes, std::io::Error>`. Embedders are expected to adapt
-//! their outer body error to `std::io::Error` at the boundary.
+//! `NdnDirServer` implements the [`buckyos_http_server::HttpServer`] trait so
+//! it composes with the standard zone-gateway runner alongside the rest of the
+//! cyfs-ndn HTTP servers. The body type is the canonical
+//! `BoxBody<Bytes, ServerError>` shared across the suite.
 
+use async_trait::async_trait;
+use buckyos_http_server::{
+    server_err, HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo,
+};
 use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::Frame;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -50,7 +54,8 @@ const STREAM_BUF_SIZE: usize = 64 * 1024;
 const CONTENT_TYPE_OCTET: &str = "application/octet-stream";
 const CONTENT_TYPE_CYFS_OBJECT: &str = "application/cyfs-object";
 
-type ServerBody = BoxBody<Bytes, std::io::Error>;
+type ServerBody = BoxBody<Bytes, ServerError>;
+const SERVER_ID: &str = "ndn-dir-server";
 
 /// Parsed `object.template` — a map from obj-type to an arbitrary JSON value
 /// whose `meta` field (if any) provides per-type metadata defaults.
@@ -211,28 +216,10 @@ impl NdnDirServer {
         &self.config.store_mgr
     }
 
-    /// Core HTTP entry point. Converts any internal error into a JSON error
-    /// response so the outer transport never has to translate `NdnError`.
-    pub async fn serve_request<B>(&self, request: Request<B>) -> Response<ServerBody>
-    where
-        B: http_body::Body + Send + 'static,
-        B::Data: Send,
-        B::Error: std::fmt::Display,
-    {
-        match self.route_request(request).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                let status = ndn_error_to_status(&e);
-                warn!("ndn_dir_server: {} -> {}", status, e);
-                build_error_response(status, &e.to_string())
-            }
-        }
-    }
-
-    async fn route_request<B>(&self, request: Request<B>) -> NdnResult<Response<ServerBody>>
-    where
-        B: http_body::Body + Send + 'static,
-    {
+    async fn route_request(
+        &self,
+        request: Request<BoxBody<Bytes, ServerError>>,
+    ) -> NdnResult<Response<ServerBody>> {
         if request.method() != Method::GET && request.method() != Method::HEAD {
             return Err(NdnError::Unsupported(format!(
                 "method {} is not supported",
@@ -1208,6 +1195,40 @@ impl NdnDirServer {
     }
 }
 
+#[async_trait]
+impl HttpServer for NdnDirServer {
+    /// Core HTTP entry point. Converts any internal `NdnError` into a JSON
+    /// error response so the outer transport never has to translate the
+    /// domain error type.
+    async fn serve_request(
+        &self,
+        req: Request<BoxBody<Bytes, ServerError>>,
+        _info: StreamInfo,
+    ) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+        let resp = match self.route_request(req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let status = ndn_error_to_status(&e);
+                warn!("ndn_dir_server: {} -> {}", status, e);
+                build_error_response(status, &e.to_string())
+            }
+        };
+        Ok(resp)
+    }
+
+    fn id(&self) -> String {
+        SERVER_ID.to_string()
+    }
+
+    fn http_version(&self) -> Version {
+        Version::HTTP_11
+    }
+
+    fn http3_port(&self) -> Option<u16> {
+        None
+    }
+}
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -1597,6 +1618,10 @@ fn full_body(data: Bytes) -> ServerBody {
     Full::new(data).map_err(|never| match never {}).boxed()
 }
 
+fn io_to_server_err(err: std::io::Error) -> ServerError {
+    server_err!(ServerErrorCode::IOError, "{}", err)
+}
+
 fn finalize_stream_response(
     reader: ChunkReader,
     total_size: u64,
@@ -1648,12 +1673,12 @@ fn chunk_reader_to_body(reader: ChunkReader, total: u64) -> ServerBody {
 }
 
 struct ReceiverBody {
-    rx: mpsc::Receiver<Result<Frame<Bytes>, std::io::Error>>,
+    rx: mpsc::Receiver<Result<Frame<Bytes>, ServerError>>,
 }
 
 impl http_body::Body for ReceiverBody {
     type Data = Bytes;
-    type Error = std::io::Error;
+    type Error = ServerError;
 
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
@@ -1666,7 +1691,7 @@ impl http_body::Body for ReceiverBody {
 fn chunk_reader_to_channel(
     mut reader: ChunkReader,
     total: u64,
-) -> mpsc::Receiver<Result<Frame<Bytes>, std::io::Error>> {
+) -> mpsc::Receiver<Result<Frame<Bytes>, ServerError>> {
     let (tx, rx) = mpsc::channel(2);
     tokio::spawn(async move {
         let mut sent: u64 = 0;
@@ -1683,7 +1708,7 @@ fn chunk_reader_to_channel(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(e)).await;
+                    let _ = tx.send(Err(io_to_server_err(e))).await;
                     break;
                 }
             }
