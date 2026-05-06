@@ -71,6 +71,12 @@ pub struct PathObject {
     pub iat: u64,
     pub target: ObjId,
     pub exp: u64,
+    /// Host the JWT was issued for. Bound to the request host at verify time
+    /// so a JWT signed for one zone cannot be replayed against another. Older
+    /// sidecars without this field still deserialize, but verifiers running
+    /// in production reject them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 impl PathObject {
@@ -80,6 +86,17 @@ impl PathObject {
             iat: buckyos_get_unix_timestamp(),
             target,
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 3,
+            host: None,
+        }
+    }
+
+    pub fn with_host(path: String, target: ObjId, host: String) -> Self {
+        Self {
+            path,
+            iat: buckyos_get_unix_timestamp(),
+            target,
+            exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 3,
+            host: Some(host),
         }
     }
 }

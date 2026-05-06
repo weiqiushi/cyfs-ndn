@@ -95,6 +95,11 @@ pub struct NdnDirServerConfig {
     /// the `path_obj_jwt` field; R-Link responses will lack `cyfs-path-obj`.
     pub signing_key: Option<EncodingKey>,
     pub signing_kid: Option<String>,
+    /// Hostname this server is authoritative for, written into the `host`
+    /// claim of every minted `PathObject` JWT so the client can bind the
+    /// signature to the request host. None means JWTs are unbound and
+    /// strict verifiers will reject them.
+    pub host: Option<String>,
     /// Interval at which [`NdnDirServer::spawn_scanner`] wakes up.
     pub scan_interval: Duration,
 }
@@ -113,6 +118,7 @@ impl NdnDirServerConfig {
             obj_id_in_host: false,
             signing_key: None,
             signing_kid: None,
+            host: None,
             scan_interval: DEFAULT_SCAN_INTERVAL,
         }
     }
@@ -130,6 +136,11 @@ impl NdnDirServerConfig {
     pub fn signing_key(mut self, key: EncodingKey, kid: Option<String>) -> Self {
         self.signing_key = Some(key);
         self.signing_kid = kid;
+        self
+    }
+
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
         self
     }
 
@@ -1122,7 +1133,10 @@ impl NdnDirServer {
             return Ok(None);
         };
         let semantic_path = self.semantic_path_for(source_path);
-        let path_obj = PathObject::new(semantic_path, target.clone());
+        let path_obj = match self.config.host.as_ref() {
+            Some(host) => PathObject::with_host(semantic_path, target.clone(), host.clone()),
+            None => PathObject::new(semantic_path, target.clone()),
+        };
         let path_json = serde_json::to_value(&path_obj)
             .map_err(|e| NdnError::Internal(format!("serialize PathObject failed: {}", e)))?;
         Ok(Some(named_obj_to_jwt(

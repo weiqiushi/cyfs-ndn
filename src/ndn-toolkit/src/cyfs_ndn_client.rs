@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Empty};
@@ -5,7 +6,8 @@ use hyper::Request;
 use hyper_util::client::legacy::connect::Connect;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
-use name_lib::decode_jwt_claim_without_verify;
+use jsonwebtoken::{decode as jwt_decode, decode_header, TokenData, Validation};
+use name_lib::{decode_jwt_claim_without_verify, key_scope, parse_did_doc, DID};
 use named_store::{ChunkLocalInfo, NamedDataMgr};
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode, Url};
@@ -43,22 +45,153 @@ pub struct VerifiedPathObject {
 
 /// Verifier for `cyfs-path-obj` JWTs.
 ///
-/// Production deployments should supply an implementation that resolves the
-/// trusted public key for the request hostname (via DID Document / BNS / DNS)
-/// and validates the JWT signature + `alg` + `kid`. The default verifier only
-/// checks `iat`/`exp` freshness; signature verification is intentionally
-/// deferred to host-aware implementations.
+/// The verifier owns the full trust-chain check for a Semantic Path JWT:
+/// resolve the issuing zone from `requested_host`, pick the public key by
+/// the JWT header's `kid`, confirm the kid is allowed to assert paths
+/// (W3C `assertionMethod`), verify the signature, and bind the claims back
+/// to the request (`path`, `host`).
+///
+/// The default implementation [`NameClientPathVerifier`] uses
+/// `name_client::resolve_did` to fetch the verified `ZoneConfig`; that
+/// resolver handles caching, freshness, and BNS lookup internally.
+#[async_trait]
 pub trait PathObjectVerifier: Send + Sync {
-    fn verify(&self, jwt: &str, host: Option<&str>) -> NdnResult<VerifiedPathObject>;
+    async fn verify(
+        &self,
+        jwt: &str,
+        requested_host: Option<&str>,
+        requested_path: Option<&str>,
+    ) -> NdnResult<VerifiedPathObject>;
 }
 
-/// Default verifier: decode JWT claims without signature check, enforce
-/// `iat <= now < exp`. Intended for tests and sandbox use.
+/// Production verifier backed by `name_client::resolve_did`.
+///
+/// Steps:
+/// 1. Map `requested_host` → `DID`, then `resolve_did(did, "zone")` to get the
+///    verified `ZoneConfig`.
+/// 2. Pick `DecodingKey` via `ZoneConfig::get_auth_key(jwt.header.kid)`.
+/// 3. Check the kid is allowed in scope `key_scope::ZONE_PUBLISH` via
+///    `DIDDocumentTrait::is_key_allowed_in_scope`.
+/// 4. Verify JWT signature + `exp`, then check `claims.path == requested_path`
+///    and `claims.host == requested_host`.
 #[derive(Debug, Default, Clone)]
-pub struct AcceptIfFreshVerifier;
+pub struct NameClientPathVerifier;
 
-impl PathObjectVerifier for AcceptIfFreshVerifier {
-    fn verify(&self, jwt: &str, _host: Option<&str>) -> NdnResult<VerifiedPathObject> {
+#[async_trait]
+impl PathObjectVerifier for NameClientPathVerifier {
+    async fn verify(
+        &self,
+        jwt: &str,
+        requested_host: Option<&str>,
+        requested_path: Option<&str>,
+    ) -> NdnResult<VerifiedPathObject> {
+        let host = requested_host.ok_or_else(|| {
+            NdnError::PermissionDenied(
+                "cyfs-path-obj verification requires a request host".to_string(),
+            )
+        })?;
+
+        // 1. host -> DID -> verified ZoneConfig (resolve_did handles cache/freshness)
+        let zone_did = DID::from_str(host).map_err(|e| {
+            NdnError::InvalidParam(format!("cannot derive zone DID from host {}: {}", host, e))
+        })?;
+        let encoded = name_client::resolve_did(&zone_did, Some("zone"))
+            .await
+            .map_err(|e| {
+                NdnError::PermissionDenied(format!(
+                    "resolve zone document for {} failed: {}",
+                    host, e
+                ))
+            })?;
+        let zone_doc = parse_did_doc(encoded)
+            .map_err(|e| NdnError::DecodeError(format!("parse zone doc failed: {}", e)))?;
+
+        // 2. JWT header -> kid -> public key
+        let header = decode_header(jwt).map_err(|e| {
+            NdnError::DecodeError(format!("decode cyfs-path-obj jwt header failed: {}", e))
+        })?;
+        let kid_owned = header.kid.clone();
+        let kid_ref = kid_owned.as_deref();
+        let (decoding_key, _jwk) = zone_doc.get_auth_key(kid_ref).ok_or_else(|| {
+            NdnError::PermissionDenied(format!(
+                "no key for kid {:?} in zone {}",
+                kid_owned, host
+            ))
+        })?;
+
+        // 3. capability: kid must be allowed in zone:publish scope
+        let key_id = kid_ref.unwrap_or("#main_key");
+        if !zone_doc.is_key_allowed_in_scope(key_scope::ZONE_PUBLISH, key_id) {
+            return Err(NdnError::PermissionDenied(format!(
+                "kid {} not allowed in scope {} for zone {}",
+                key_id,
+                key_scope::ZONE_PUBLISH,
+                host
+            )));
+        }
+
+        // 4. verify signature + claims (exp validated by jsonwebtoken)
+        let mut validation = Validation::new(header.alg);
+        validation.validate_exp = true;
+        validation.validate_nbf = false;
+        let token_data: TokenData<PathObject> = jwt_decode(jwt, &decoding_key, &validation)
+            .map_err(|e| {
+                NdnError::PermissionDenied(format!("verify cyfs-path-obj signature failed: {}", e))
+            })?;
+        let claims = token_data.claims;
+
+        // 5. Bind claims to the actual request.
+        let claim_host = claims.host.as_deref().ok_or_else(|| {
+            NdnError::PermissionDenied(
+                "cyfs-path-obj missing host claim; cannot bind to request".to_string(),
+            )
+        })?;
+        if claim_host != host {
+            return Err(NdnError::PermissionDenied(format!(
+                "cyfs-path-obj host {} != request host {}",
+                claim_host, host
+            )));
+        }
+        if let Some(req_path) = requested_path {
+            if claims.path != req_path {
+                return Err(NdnError::PermissionDenied(format!(
+                    "cyfs-path-obj path {} != requested {}",
+                    claims.path, req_path
+                )));
+            }
+        }
+        let now = buckyos_kit::buckyos_get_unix_timestamp();
+        if claims.iat > now + 60 {
+            return Err(NdnError::InvalidData(format!(
+                "cyfs-path-obj iat {} is in the future (now={})",
+                claims.iat, now
+            )));
+        }
+
+        Ok(VerifiedPathObject {
+            path: claims.path,
+            target: claims.target,
+            iat: claims.iat,
+            exp: claims.exp,
+        })
+    }
+}
+
+/// Test-only verifier: decodes JWT claims **without** signature check, enforces
+/// only `iat <= now < exp`. Never use in production — it provides no integrity
+/// guarantee. Useful for unit tests where minting a real signed JWT against a
+/// real zone document would be excessive.
+#[derive(Debug, Default, Clone)]
+pub struct InsecureFreshOnlyVerifier;
+
+#[async_trait]
+impl PathObjectVerifier for InsecureFreshOnlyVerifier {
+    async fn verify(
+        &self,
+        jwt: &str,
+        _requested_host: Option<&str>,
+        requested_path: Option<&str>,
+    ) -> NdnResult<VerifiedPathObject> {
         let claims = decode_jwt_claim_without_verify(jwt).map_err(|e| {
             NdnError::DecodeError(format!("decode cyfs-path-obj jwt failed: {}", e))
         })?;
@@ -79,6 +212,15 @@ impl PathObjectVerifier for AcceptIfFreshVerifier {
                 "cyfs-path-obj expired at {} (now={})",
                 path_obj.exp, now
             )));
+        }
+
+        if let Some(req_path) = requested_path {
+            if path_obj.path != req_path {
+                return Err(NdnError::PermissionDenied(format!(
+                    "cyfs-path-obj path {} != requested {}",
+                    path_obj.path, req_path
+                )));
+            }
         }
 
         Ok(VerifiedPathObject {
@@ -315,7 +457,7 @@ impl CyfsNdnClientBuilder {
             obj_id_in_host: self.obj_id_in_host,
             path_verifier: self
                 .path_verifier
-                .unwrap_or_else(|| Arc::new(AcceptIfFreshVerifier::default())),
+                .unwrap_or_else(|| Arc::new(NameClientPathVerifier::default())),
         })
     }
 }
@@ -544,7 +686,8 @@ impl CyfsNdnRequestBuilder {
             &response.headers,
             response.content_length,
             self.client.path_verifier.as_ref(),
-        )?;
+        )
+        .await?;
 
         Ok(CyfsNdnResponse {
             client: self.client,
@@ -780,7 +923,7 @@ pub struct ResolvedParent {
 }
 
 impl CyfsResponseMeta {
-    fn from_response(
+    async fn from_response(
         resolved_url: &ResolvedUrl,
         known_obj_id: Option<ObjId>,
         resp_raw: bool,
@@ -793,15 +936,20 @@ impl CyfsResponseMeta {
             cyfs_headers.chunk_size = content_length;
         }
 
-        // Verify path-obj JWT when we have a semantic URL.
-        let path_object = match (&cyfs_headers.path_obj, resolved_url.semantic_path()) {
-            (Some(jwt), Some(_)) if !resp_raw => {
-                let verified = path_verifier.verify(jwt, resolved_url.host())?;
+        // Verify path-obj JWT when we have a semantic URL. The semantic path
+        // (when present) is bound into the verifier so claim/path mismatch is
+        // rejected up-front. For O-Link URLs the path-obj is still verified
+        // for signature + freshness but path-binding is skipped.
+        let semantic_path = resolved_url.semantic_path();
+        let path_object = match (&cyfs_headers.path_obj, semantic_path.as_deref()) {
+            (Some(jwt), Some(path)) if !resp_raw => {
+                let verified = path_verifier
+                    .verify(jwt, resolved_url.host(), Some(path))
+                    .await?;
                 Some(verified)
             }
             (Some(jwt), None) if !resp_raw => {
-                // Still verify freshness / signature if present even if URL is an O-Link.
-                Some(path_verifier.verify(jwt, resolved_url.host())?)
+                Some(path_verifier.verify(jwt, resolved_url.host(), None).await?)
             }
             _ => None,
         };
@@ -828,21 +976,40 @@ impl CyfsResponseMeta {
     }
 
     /// The effective ObjectId of the response body, taking all signals into
-    /// account. Priority: explicit `obj_id(...)` call > `cyfs-obj-id` header >
-    /// last parent's inner_path resolution > URL ObjId.
-    pub fn effective_obj_id(&self) -> Option<ObjId> {
+    /// account.
+    ///
+    /// Priority — high to low:
+    /// 1. Explicit `obj_id(...)` call from the caller.
+    /// 2. Verified `cyfs-path-obj` JWT — its `target` claim *binds* the
+    ///    semantic path to an ObjId. When present and the URL has no
+    ///    inner_path, this overrides the unsigned `cyfs-obj-id` header. If
+    ///    both are present and disagree, the call fails (a server cannot
+    ///    quietly redirect a signed binding via an unsigned header).
+    /// 3. `cyfs-obj-id` response header (unsigned).
+    /// 4. URL ObjId (O-Link / R-Link).
+    pub fn effective_obj_id(&self) -> NdnResult<Option<ObjId>> {
         if let Some(obj_id) = self.known_obj_id.clone() {
-            return Some(obj_id);
+            return Ok(Some(obj_id));
         }
-        if let Some(obj_id) = self.cyfs_headers.obj_id.clone() {
-            return Some(obj_id);
-        }
+        // When a verified path-obj exists *and* no inner_path is involved, its
+        // target is the canonical binding — outranks the unsigned header.
         if let Some(path) = self.path_object.as_ref() {
             if self.url_inner_path_steps.is_empty() && self.parents.is_empty() {
-                return Some(path.target.clone());
+                if let Some(header_id) = self.cyfs_headers.obj_id.as_ref() {
+                    if header_id != &path.target {
+                        return Err(NdnError::PermissionDenied(format!(
+                            "cyfs-obj-id header {} contradicts signed cyfs-path-obj target {}",
+                            header_id, path.target
+                        )));
+                    }
+                }
+                return Ok(Some(path.target.clone()));
             }
         }
-        self.url_obj_id.clone()
+        if let Some(obj_id) = self.cyfs_headers.obj_id.clone() {
+            return Ok(Some(obj_id));
+        }
+        Ok(self.url_obj_id.clone())
     }
 
     /// Verify the inner_path chain: for each `/@/` segment in the URL, ensure
@@ -1085,7 +1252,7 @@ impl CyfsNdnResponse {
             self.meta.verify_inner_path_chain()?;
         }
 
-        let effective_obj_id = self.meta.effective_obj_id();
+        let effective_obj_id = self.meta.effective_obj_id()?;
         let transport_url = self.meta.transport_url.clone();
         let mut reader = self.reader();
         let mut raw = Vec::new();
@@ -1204,7 +1371,7 @@ impl CyfsNdnResponse {
             };
         }
 
-        let effective_obj_id = self.meta.effective_obj_id().ok_or_else(|| {
+        let effective_obj_id = self.meta.effective_obj_id()?.ok_or_else(|| {
             NdnError::InvalidId(format!(
                 "cannot infer obj id for {}",
                 self.meta.transport_url
@@ -1274,7 +1441,7 @@ impl CyfsNdnResponse {
             }
         }
 
-        let effective_obj_id = self.meta.effective_obj_id().ok_or_else(|| {
+        let effective_obj_id = self.meta.effective_obj_id()?.ok_or_else(|| {
             NdnError::InvalidId(format!(
                 "cannot infer obj id for {}",
                 self.meta.transport_url
@@ -1342,7 +1509,7 @@ impl CyfsNdnResponse {
         metadata_to_store: Vec<KnownObjectToStore>,
         file_action: Option<NdnAction>,
     ) -> NdnResult<CyfsPullResult> {
-        let effective_obj_id = self.meta.effective_obj_id();
+        let effective_obj_id = self.meta.effective_obj_id()?;
         let header_chunk_size = self.meta.cyfs_headers.chunk_size;
         let is_range_request = self.request.range.is_some();
         let progress_callback = self.request.progress_callback.clone();
@@ -1486,7 +1653,7 @@ impl CyfsNdnResponse {
         file_action: Option<NdnAction>,
         file_size: u64,
     ) -> NdnResult<CyfsPullResult> {
-        let effective_obj_id = self.meta.effective_obj_id();
+        let effective_obj_id = self.meta.effective_obj_id()?;
         let progress_callback = self.request.progress_callback.clone();
         let original_url = self.request.resolved_url.original_url.clone();
         let mut reader = self.reader();

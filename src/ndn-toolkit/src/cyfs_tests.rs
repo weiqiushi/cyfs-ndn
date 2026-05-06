@@ -25,8 +25,8 @@ use tempfile::TempDir;
 use url::Url;
 
 use crate::cyfs_ndn_client::{
-    AcceptIfFreshVerifier, CyfsHttpTransport, CyfsNdnClient, CyfsTransportRequest,
-    CyfsTransportResponse, PathObjectVerifier,
+    CyfsHttpTransport, CyfsNdnClient, CyfsTransportRequest, CyfsTransportResponse,
+    InsecureFreshOnlyVerifier, PathObjectVerifier,
 };
 use crate::cyfs_ndn_dir_server::{NdnDirServer, NdnDirServerConfig, NdnDirServerMode};
 use named_store::{NamedDataMgr, NamedLocalStore, StoreLayout, StoreTarget};
@@ -212,6 +212,7 @@ async fn make_server_client_pair(
 
     let client = CyfsNdnClient::builder()
         .transport(InProcServerTransport::new(server.clone()))
+        .path_verifier(InsecureFreshOnlyVerifier::default())
         .build()
         .unwrap();
 
@@ -410,27 +411,29 @@ fn clist_05_chunk_order_changes_clist_id() {
 // L2 — PathObject JWT
 // =====================================================================
 
-/// PATH-06: `AcceptIfFreshVerifier` must accept a JWT when `now` falls within
-/// `[iat, exp)` and reject it once `exp` has passed. This exercises the
-/// protocol's time-window contract even though signature verification is
+/// PATH-06: `InsecureFreshOnlyVerifier` must accept a JWT when `now` falls
+/// within `[iat, exp)` and reject it once `exp` has passed. This exercises
+/// the protocol's time-window contract even though signature verification is
 /// deferred to host-aware verifiers.
-#[test]
-fn path_06_path_jwt_exp_window_enforced() {
+#[tokio::test]
+async fn path_06_path_jwt_exp_window_enforced() {
     let target = ObjId::new("sha256:0102030405").unwrap();
     let now = buckyos_kit::buckyos_get_unix_timestamp();
 
     // Fresh window: iat in the past, exp in the future.
     let fresh = mint_unsigned_path_jwt("/repo/readme", &target, now - 30, now + 300);
-    let verified = AcceptIfFreshVerifier::default()
-        .verify(&fresh, Some("alice.example"))
+    let verified = InsecureFreshOnlyVerifier::default()
+        .verify(&fresh, Some("alice.example"), Some("/repo/readme"))
+        .await
         .expect("fresh JWT should verify");
     assert_eq!(verified.path, "/repo/readme");
     assert_eq!(verified.target, target);
 
     // Expired window: exp already passed.
     let stale = mint_unsigned_path_jwt("/repo/readme", &target, now - 3600, now - 10);
-    let err = AcceptIfFreshVerifier::default()
-        .verify(&stale, Some("alice.example"))
+    let err = InsecureFreshOnlyVerifier::default()
+        .verify(&stale, Some("alice.example"), Some("/repo/readme"))
+        .await
         .unwrap_err();
     assert!(
         matches!(err, NdnError::InvalidData(_)),
@@ -440,8 +443,9 @@ fn path_06_path_jwt_exp_window_enforced() {
 
     // iat far in the future — verifier rejects as not-yet-valid.
     let future_iat = mint_unsigned_path_jwt("/repo/readme", &target, now + 7200, now + 10800);
-    let err = AcceptIfFreshVerifier::default()
-        .verify(&future_iat, Some("alice.example"))
+    let err = InsecureFreshOnlyVerifier::default()
+        .verify(&future_iat, Some("alice.example"), Some("/repo/readme"))
+        .await
         .unwrap_err();
     assert!(matches!(err, NdnError::InvalidData(_)));
 }
@@ -919,5 +923,5 @@ async fn clist_dir_03_file_object_content_chunklist_streams_content() {
 
 #[test]
 fn path_verifier_is_trait_object_compatible() {
-    let _v: Arc<dyn PathObjectVerifier> = Arc::new(AcceptIfFreshVerifier::default());
+    let _v: Arc<dyn PathObjectVerifier> = Arc::new(InsecureFreshOnlyVerifier::default());
 }
