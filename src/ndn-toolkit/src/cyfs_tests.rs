@@ -28,7 +28,10 @@ use crate::cyfs_ndn_client::{
     CyfsHttpTransport, CyfsNdnClient, CyfsTransportRequest, CyfsTransportResponse,
     InsecureFreshOnlyVerifier, PathObjectVerifier,
 };
-use crate::cyfs_ndn_dir_server::{NdnDirServer, NdnDirServerConfig, NdnDirServerMode};
+use crate::cyfs_ndn_dir_server::{
+    NdnDirServer, NdnDirServerConfig, NdnDirServerMode, SidecarRecord,
+};
+use filetime::{set_file_mtime, FileTime};
 use named_store::{NamedDataMgr, NamedLocalStore, StoreLayout, StoreTarget};
 use ndn_lib::{
     build_named_object_by_json, cyfs_parse_url, ChunkHasher, ChunkId, ChunkList, ChunkType,
@@ -154,8 +157,9 @@ impl CyfsHttpTransport for InProcServerTransport {
                     hdrs.insert(name, value);
                 }
             }
-            let body: BoxBody<Bytes, ServerError> =
-                Empty::<Bytes>::new().map_err(|never| match never {}).boxed();
+            let body: BoxBody<Bytes, ServerError> = Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed();
             let req_http = builder
                 .body(body)
                 .map_err(|e| NdnError::Internal(format!("build http request: {}", e)))?;
@@ -508,6 +512,108 @@ async fn e2e_01_r_link_file_pull_via_server() {
     assert!(store_mgr.have_chunk(&ChunkId::from_obj_id(&chunk_id)).await);
 }
 
+/// E2E-02: auto-objectified FileObjects must be written into NamedStoreMgr so
+/// the generated `cyfile:...` is reachable by O-Link, not only via R-Link
+/// sidecar lookup.
+#[tokio::test]
+async fn e2e_02_auto_file_object_is_o_link_reachable() {
+    let tmp = TempDir::new().unwrap();
+    let (server, _, store_mgr) = make_server_client_pair(tmp.path()).await;
+
+    let root = server.config().semantic_root.clone();
+    let file_bytes = deterministic_bytes(16 * 1024 + 91);
+    tokio::fs::write(root.join("olink.bin"), &file_bytes)
+        .await
+        .unwrap();
+    server.scan_and_objectify().await.unwrap();
+
+    let sidecar = SidecarRecord::read_from(&root.join("olink.bin.cyobj")).unwrap();
+    let file_obj_id = ObjId::new(&sidecar.obj_id).unwrap();
+    let stored = store_mgr.get_object(&file_obj_id).await.unwrap();
+    let (_, sidecar_canonical) = build_named_object_by_json(OBJ_TYPE_FILE, &sidecar.obj_json);
+    assert_eq!(stored, sidecar_canonical);
+
+    let path = format!("/ndn/{}", file_obj_id.to_string());
+    let (status, headers, body) = server_get(&server, &path).await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(body, file_bytes);
+    assert!(headers.get("cyfs-parents-0").is_some());
+}
+
+/// E2E-03: the scanner must not trust second-resolution mtime + size alone.
+/// Same-size rewrites with the same mtime still need to refresh the sidecar.
+#[tokio::test]
+async fn e2e_03_same_mtime_same_size_rewrite_refreshes_sidecar() {
+    let tmp = TempDir::new().unwrap();
+    let (server, _, _) = make_server_client_pair(tmp.path()).await;
+
+    let root = server.config().semantic_root.clone();
+    let file_path = root.join("rewrite.bin");
+    let first = deterministic_bytes(16 * 1024 + 31);
+    let mut second = first.clone();
+    second[0] ^= 0xFF;
+    let last = second.len() - 1;
+    second[last] ^= 0x7F;
+    let fixed_time = FileTime::from_unix_time(1_700_000_000, 0);
+
+    tokio::fs::write(&file_path, &first).await.unwrap();
+    set_file_mtime(&file_path, fixed_time).unwrap();
+    server.scan_and_objectify().await.unwrap();
+    let first_sidecar = SidecarRecord::read_from(&root.join("rewrite.bin.cyobj")).unwrap();
+
+    tokio::fs::write(&file_path, &second).await.unwrap();
+    set_file_mtime(&file_path, fixed_time).unwrap();
+    server.scan_and_objectify().await.unwrap();
+    let second_sidecar = SidecarRecord::read_from(&root.join("rewrite.bin.cyobj")).unwrap();
+
+    assert_ne!(first_sidecar.obj_id, second_sidecar.obj_id);
+    let path = format!("/ndn/{}", second_sidecar.obj_id);
+    let (status, _, body) = server_get(&server, &path).await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(body, second);
+}
+
+/// E2E-04: changing root `object.template` must rebuild existing sidecars even
+/// when the source file bytes did not change.
+#[tokio::test]
+async fn e2e_04_template_change_refreshes_existing_file_sidecar() {
+    let tmp = TempDir::new().unwrap();
+    let (server, _, _) = make_server_client_pair(tmp.path()).await;
+
+    let root = server.config().semantic_root.clone();
+    let file_bytes = deterministic_bytes(16 * 1024 + 73);
+    tokio::fs::write(root.join("templated.bin"), &file_bytes)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        root.join("object.template"),
+        br#"{"cyfile":{"meta":{"channel":"v1"}}}"#,
+    )
+    .await
+    .unwrap();
+    server.scan_and_objectify().await.unwrap();
+    let first_sidecar = SidecarRecord::read_from(&root.join("templated.bin.cyobj")).unwrap();
+    assert_eq!(
+        first_sidecar.obj_json.get("channel"),
+        Some(&serde_json::json!("v1"))
+    );
+
+    tokio::fs::write(
+        root.join("object.template"),
+        br#"{"cyfile":{"meta":{"channel":"v2"}}}"#,
+    )
+    .await
+    .unwrap();
+    server.scan_and_objectify().await.unwrap();
+    let second_sidecar = SidecarRecord::read_from(&root.join("templated.bin.cyobj")).unwrap();
+
+    assert_ne!(first_sidecar.obj_id, second_sidecar.obj_id);
+    assert_eq!(
+        second_sidecar.obj_json.get("channel"),
+        Some(&serde_json::json!("v2"))
+    );
+}
+
 /// RAW-01 + RAW-02: `?resp=raw` returns the raw object bytes and MUST NOT
 /// attach `cyfs-path-obj` / `cyfs-parents-N` / `cyfs-obj-id` headers.
 #[tokio::test]
@@ -741,8 +847,9 @@ async fn server_get(
     server: &Arc<NdnDirServer>,
     path_and_query: &str,
 ) -> (http::StatusCode, http::HeaderMap<HttpHeaderValue>, Vec<u8>) {
-    let body: BoxBody<Bytes, ServerError> =
-        Empty::<Bytes>::new().map_err(|never| match never {}).boxed();
+    let body: BoxBody<Bytes, ServerError> = Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed();
     let req = HttpRequest::builder()
         .method("GET")
         .uri(path_and_query)

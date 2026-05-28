@@ -182,10 +182,14 @@ pub struct SidecarRecord {
     /// Size of the source file in bytes.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source_size: Option<u64>,
+    /// Signature of the root `object.template` that influenced objectification.
+    /// A template edit must refresh sidecars even when source bytes are stable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_template_qcid: Option<String>,
 }
 
 impl SidecarRecord {
-    fn read_from(path: &Path) -> NdnResult<Self> {
+    pub(crate) fn read_from(path: &Path) -> NdnResult<Self> {
         let bytes = std::fs::read(path).map_err(|e| {
             NdnError::IoError(format!("read sidecar {} failed: {}", path.display(), e))
         })?;
@@ -786,9 +790,15 @@ impl NdnDirServer {
         }
 
         let template = load_object_template(&root);
+        let template_signature = compute_template_signature(&root);
         let mut processed = 0usize;
-        self.walk_and_objectify(&root, template.as_ref(), &mut processed)
-            .await?;
+        self.walk_and_objectify(
+            &root,
+            template.as_ref(),
+            template_signature.as_deref(),
+            &mut processed,
+        )
+        .await?;
         Ok(processed)
     }
 
@@ -797,6 +807,7 @@ impl NdnDirServer {
         &self,
         dir: &Path,
         template: Option<&'async_recursion ObjectTemplate>,
+        template_signature: Option<&'async_recursion str>,
         processed: &mut usize,
     ) -> NdnResult<()> {
         let read = std::fs::read_dir(dir)
@@ -819,7 +830,10 @@ impl NdnDirServer {
             if file_type.is_dir() {
                 let dirobj_meta = path.join(DIROBJ_META_FILE);
                 if dirobj_meta.is_file() {
-                    match self.objectify_directory(&path, template).await {
+                    match self
+                        .objectify_directory(&path, template, template_signature)
+                        .await
+                    {
                         Ok(true) => *processed += 1,
                         Ok(false) => {}
                         Err(e) => warn!(
@@ -829,7 +843,8 @@ impl NdnDirServer {
                         ),
                     }
                 } else {
-                    self.walk_and_objectify(&path, template, processed).await?;
+                    self.walk_and_objectify(&path, template, template_signature, processed)
+                        .await?;
                 }
             } else if file_type.is_file() {
                 if name == DIROBJ_META_FILE || name == OBJECT_TEMPLATE_FILE {
@@ -838,7 +853,10 @@ impl NdnDirServer {
                 if name.ends_with(SIDECAR_SUFFIX) {
                     continue;
                 }
-                match self.objectify_file(&path, template).await {
+                match self
+                    .objectify_file(&path, template, template_signature)
+                    .await
+                {
                     Ok(true) => *processed += 1,
                     Ok(false) => {}
                     Err(e) => warn!("ndn_dir_server: objectify {} failed: {}", path.display(), e),
@@ -872,6 +890,7 @@ impl NdnDirServer {
         &self,
         file_path: &Path,
         template: Option<&ObjectTemplate>,
+        template_signature: Option<&str>,
     ) -> NdnResult<bool> {
         let file_name = match file_path.file_name().and_then(|s| s.to_str()) {
             Some(n) => n.to_string(),
@@ -904,17 +923,48 @@ impl NdnDirServer {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Decide whether an existing sidecar is already current. For
-        // performance we only recompute QCID when the cheap mtime/size check
-        // indicates a possible change.
+        let mut current_qcid: Option<String> = None;
+
+        // Decide whether an existing sidecar is already current. QCID is the
+        // authoritative source-content check; mtime/size alone can miss
+        // same-second, same-size rewrites.
         if sidecar_path.is_file() {
             if let Ok(existing) = SidecarRecord::read_from(&sidecar_path) {
-                if existing.source_size == Some(size) && existing.source_mtime == Some(mtime) {
-                    return Ok(false);
+                let template_matches =
+                    existing.source_template_qcid.as_deref() == template_signature;
+                if template_matches {
+                    let qcid = caculate_qcid_from_file(file_path)
+                        .await
+                        .ok()
+                        .map(|c| c.to_string());
+                    current_qcid = qcid.clone();
+                    if existing.source_qcid.is_some() && existing.source_qcid == qcid {
+                        return Ok(false);
+                    }
+                    if existing.source_qcid.is_none()
+                        && existing.source_size == Some(size)
+                        && existing.source_mtime == Some(mtime)
+                    {
+                        return Ok(false);
+                    }
                 }
-                // mtime / size drifted — confirm via QCID before recomputing.
-                let qcid = caculate_qcid_from_file(file_path).await?;
-                if existing.source_qcid.as_deref() == Some(qcid.to_string().as_str()) {
+            }
+        }
+
+        let source_qcid = match current_qcid {
+            Some(qcid) => Some(qcid),
+            None => caculate_qcid_from_file(file_path)
+                .await
+                .ok()
+                .map(|c| c.to_string()),
+        };
+
+        if sidecar_path.is_file() {
+            if let Ok(existing) = SidecarRecord::read_from(&sidecar_path) {
+                if existing.source_template_qcid.as_deref() == template_signature
+                    && existing.source_qcid.is_some()
+                    && existing.source_qcid == source_qcid
+                {
                     return Ok(false);
                 }
             }
@@ -942,26 +992,30 @@ impl NdnDirServer {
         apply_template_to_file(&mut file_obj, template);
         let file_json = serde_json::to_value(&file_obj)
             .map_err(|e| NdnError::Internal(format!("serialize FileObject failed: {}", e)))?;
-        let (file_obj_id, _) = build_named_object_by_json(OBJ_TYPE_FILE, &file_json);
+        let (file_obj_id, file_obj_str) = build_named_object_by_json(OBJ_TYPE_FILE, &file_json);
 
         // Register the chunk with the store according to mode. We do this
         // before writing the sidecar so a crash leaves the store consistent
         // and the sidecar absent — the next scan pass will retry.
         self.register_chunk_in_store(file_path, &chunk_id, chunk_size)
             .await?;
+        self.config
+            .store_mgr
+            .put_object(&file_obj_id, &file_obj_str)
+            .await?;
 
         // Mint a PathObject JWT for the semantic binding if we have a key.
         let path_obj_jwt = self.mint_path_jwt(file_path, &file_obj_id)?;
 
-        let qcid = caculate_qcid_from_file(file_path).await.ok();
         let record = SidecarRecord {
             obj_type: OBJ_TYPE_FILE.to_string(),
             obj_id: file_obj_id.to_string(),
             obj_json: file_json,
             path_obj_jwt,
-            source_qcid: qcid.map(|c| c.to_string()),
+            source_qcid,
             source_mtime: Some(mtime),
             source_size: Some(size),
+            source_template_qcid: template_signature.map(|s| s.to_string()),
         };
         record.write_to(&sidecar_path)?;
 
@@ -988,6 +1042,7 @@ impl NdnDirServer {
         &self,
         dir_path: &Path,
         template: Option<&ObjectTemplate>,
+        template_signature: Option<&str>,
     ) -> NdnResult<bool> {
         let sidecar_path = append_extension(dir_path, SIDECAR_SUFFIX);
         let signature = compute_dir_signature(dir_path)?;
@@ -996,6 +1051,7 @@ impl NdnDirServer {
             if let Ok(existing) = SidecarRecord::read_from(&sidecar_path) {
                 if existing.obj_type == OBJ_TYPE_DIR
                     && existing.source_qcid.as_deref() == Some(signature.as_str())
+                    && existing.source_template_qcid.as_deref() == template_signature
                 {
                     return Ok(false);
                 }
@@ -1029,6 +1085,7 @@ impl NdnDirServer {
             source_qcid: Some(signature),
             source_mtime: None,
             source_size: Some(total_size),
+            source_template_qcid: template_signature.map(|s| s.to_string()),
         };
         record.write_to(&sidecar_path)?;
 
@@ -1400,6 +1457,17 @@ fn load_object_template(root: &Path) -> Option<ObjectTemplate> {
             None
         }
     }
+}
+
+fn compute_template_signature(root: &Path) -> Option<String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let path = root.join(OBJECT_TEMPLATE_FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(format!("tpl:{:016x}", hasher.finish()))
 }
 
 fn template_meta_for<'a>(

@@ -93,7 +93,8 @@
   "path_obj_jwt": "...",
   "source_qcid": "...",
   "source_mtime": 1710000000,
-  "source_size": 123
+  "source_size": 123,
+  "source_template_qcid": "tpl:..."
 }
 ```
 
@@ -102,6 +103,7 @@
 - `obj_json` 是实际 NamedObject JSON；自动对象化时模板/目录覆盖后的元数据会体现在这里。
 - `path_obj_jwt` 只有配置了签名私钥时才会生成。
 - `source_qcid`、`source_mtime`、`source_size` 用于扫描器判断 sidecar 是否需要刷新。目录对象化时 `source_qcid` 保存目录签名，`source_mtime` 为空，`source_size` 为目录总大小。
+- `source_template_qcid` 保存本次对象化使用的根目录 `object.template` 签名；模板内容变化时，即使源文件/目录内容未变，也会刷新 sidecar。
 
 ## 添加任意NamedObject
 通过手工创建xxx.cyobj,也可以在该路径位置创建任意NamedObject
